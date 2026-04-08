@@ -272,10 +272,15 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # Keep sending typing action in background
     typing_task = asyncio.create_task(_keep_typing(update.effective_chat))
 
+    # Resolve session cwd so claude runs in the right directory
+    session = get_session_by_id(session_id)
+    session_cwd = session.cwd if session else None
+
     try:
         response = await bridge.send_message(
             session_id=session_id,
             message=user_text,
+            cwd=session_cwd,
             on_delta=on_delta,
         )
     finally:

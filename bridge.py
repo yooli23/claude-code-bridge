@@ -21,6 +21,7 @@ class ClaudeBridge:
         self,
         session_id: str,
         message: str,
+        cwd: str | None = None,
         on_delta: callable = None,
     ) -> str:
         """Send a message to a Claude Code session and return the full response.
@@ -28,6 +29,7 @@ class ClaudeBridge:
         Args:
             session_id: The session UUID to resume.
             message: The user message to send.
+            cwd: Working directory to run claude from (must match session's original cwd).
             on_delta: Optional async callback(text_so_far) called on each stream chunk.
 
         Returns:
@@ -38,6 +40,7 @@ class ClaudeBridge:
             "--resume", session_id,
             "--permission-mode", self.permission_mode,
             "--output-format", "stream-json",
+            "--verbose",
             "--print",
             message,
         ]
@@ -48,13 +51,14 @@ class ClaudeBridge:
         logger.info(f"Running: {' '.join(cmd[:6])}...")
 
         env = os.environ.copy()
-        env["CLAUDE_CODE_IS_SANDBOX"] = "1"
+        env["IS_SANDBOX"] = "1"
 
         process = await asyncio.create_subprocess_exec(
             *cmd,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
             env=env,
+            cwd=cwd,
         )
 
         full_text = ""
