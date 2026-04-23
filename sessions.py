@@ -197,7 +197,7 @@ def get_session_by_id(session_id: str, claude_dir: str | None = None) -> Session
     return None
 
 
-def get_last_assistant_message(session: SessionInfo, max_length: int = 500) -> str | None:
+def get_last_assistant_message(session: SessionInfo) -> str | None:
     """Extract the last assistant text message from a session JSONL file."""
     last_text = None
     try:
@@ -228,6 +228,4 @@ def get_last_assistant_message(session: SessionInfo, max_length: int = 500) -> s
     except (OSError, PermissionError):
         return None
 
-    if last_text and len(last_text) > max_length:
-        last_text = last_text[:max_length - 3] + "..."
     return last_text

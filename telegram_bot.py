@@ -229,17 +229,17 @@ async def callback_pick_session(update: Update, context: ContextTypes.DEFAULT_TY
 
     session = get_session_by_id(session_id)
     if session:
-        text = (
+        header = (
             f"Connected to session {session.short_id}\n"
             f"Directory: {session.cwd}\n"
-            f"Topic: {session.display_name}\n\n"
+            f"Topic: {session.display_name}"
         )
+        await query.edit_message_text(header)
         last_msg = get_last_assistant_message(session)
         if last_msg:
-            text += f"Last message:\n\n{last_msg}"
-        else:
-            text += "Send messages to continue this session."
-        await query.edit_message_text(text)
+            chunks = split_message(last_msg, TELEGRAM_MAX_LEN)
+            for chunk in chunks:
+                await query.message.reply_text(chunk)
     else:
         await query.edit_message_text(
             f"Connected to session {session_id[:8]}.\nSend messages to continue."

@@ -499,12 +499,13 @@ class SessionSelectView(discord.ui.View):
             )
             embed.add_field(name="Directory", value=f"`{session.cwd}`", inline=False)
             embed.add_field(name="Topic", value=session.display_name, inline=False)
+            embed.set_footer(text="Send messages to continue this session.")
+            await interaction.response.send_message(embed=embed)
             last_msg = get_last_assistant_message(session)
             if last_msg:
-                embed.add_field(name="Last message", value=last_msg, inline=False)
-            else:
-                embed.set_footer(text="Send messages to continue this session.")
-            await interaction.response.send_message(embed=embed)
+                chunks = split_message(last_msg, DISCORD_MAX_LEN)
+                for chunk in chunks:
+                    await interaction.followup.send(chunk)
         else:
             await interaction.response.send_message(
                 f"Connected to session `{session_id[:8]}`. Send messages to continue."
