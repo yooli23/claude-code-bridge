@@ -475,6 +475,14 @@ class ClaudeBot(discord.Client):
                 )
                 return
 
+            if not config_store.get_user(interaction.user.id):
+                await interaction.response.send_message(
+                    "Please register first: `/register <your name> <your email>`\n"
+                    "This sets your git identity so commits are attributed to you.",
+                    ephemeral=True,
+                )
+                return
+
             await interaction.response.defer()
 
             # Create git worktree
@@ -613,22 +621,17 @@ class ClaudeBot(discord.Client):
             await chat_queue.enqueue(thread.id, wrapped, process_initial)
 
         @self.tree.command(name="status", description="Show all active tasks in this project")
-        async def cmd_status(interaction: discord.Interaction):
+        @app_commands.describe(forum_channel="Target forum channel (optional if only one project)")
+        async def cmd_status(interaction: discord.Interaction, forum_channel: discord.ForumChannel | None = None):
             if not is_allowed(interaction):
                 await interaction.response.send_message("Unauthorized.", ephemeral=True)
                 return
 
-            channel = interaction.channel
-            parent_id = None
-
-            if isinstance(channel, discord.ForumChannel):
-                parent_id = channel.id
-            elif isinstance(channel, discord.Thread) and isinstance(channel.parent, discord.ForumChannel):
-                parent_id = channel.parent_id
+            parent_id = forum_channel.id if forum_channel else _get_forum_parent_id(interaction)
 
             if not parent_id:
                 await interaction.response.send_message(
-                    "No project found. Run `/setup` first or use this in a project forum thread.", ephemeral=True
+                    "Multiple projects found. Specify a forum channel.", ephemeral=True
                 )
                 return
 
@@ -671,13 +674,16 @@ class ClaudeBot(discord.Client):
             await interaction.response.send_message(embed=embed)
 
         @self.tree.command(name="note", description="Add a note to the project's NOTES.md")
-        @app_commands.describe(content="Note to add (related work, discussion point, resource)")
-        async def cmd_note(interaction: discord.Interaction, content: str):
+        @app_commands.describe(
+            content="Note to add (related work, discussion point, resource)",
+            forum_channel="Target forum channel (optional if only one project)",
+        )
+        async def cmd_note(interaction: discord.Interaction, content: str, forum_channel: discord.ForumChannel | None = None):
             if not is_allowed(interaction):
                 await interaction.response.send_message("Unauthorized.", ephemeral=True)
                 return
 
-            binding = _get_project_binding(interaction)
+            binding = _get_project_binding(interaction, forum_channel)
             if not binding:
                 await interaction.response.send_message(
                     "No project found. Run `/setup` first.", ephemeral=True
@@ -729,12 +735,13 @@ class ClaudeBot(discord.Client):
             await interaction.followup.send(f"Added to NOTES.md and pushed:\n> {content}")
 
         @self.tree.command(name="notes", description="Show project NOTES.md")
-        async def cmd_notes(interaction: discord.Interaction):
+        @app_commands.describe(forum_channel="Target forum channel (optional if only one project)")
+        async def cmd_notes(interaction: discord.Interaction, forum_channel: discord.ForumChannel | None = None):
             if not is_allowed(interaction):
                 await interaction.response.send_message("Unauthorized.", ephemeral=True)
                 return
 
-            binding = _get_project_binding(interaction)
+            binding = _get_project_binding(interaction, forum_channel)
             if not binding:
                 await interaction.response.send_message(
                     "No project found. Run `/setup` first.", ephemeral=True
@@ -759,12 +766,13 @@ class ClaudeBot(discord.Client):
                 await interaction.followup.send(chunk)
 
         @self.tree.command(name="board", description="Full project dashboard: status, tasks, PRs, notes")
-        async def cmd_board(interaction: discord.Interaction):
+        @app_commands.describe(forum_channel="Target forum channel (optional if only one project)")
+        async def cmd_board(interaction: discord.Interaction, forum_channel: discord.ForumChannel | None = None):
             if not is_allowed(interaction):
                 await interaction.response.send_message("Unauthorized.", ephemeral=True)
                 return
 
-            binding = _get_project_binding(interaction)
+            binding = _get_project_binding(interaction, forum_channel)
             if not binding:
                 await interaction.response.send_message(
                     "No project found. Run `/setup` first.", ephemeral=True
@@ -773,7 +781,7 @@ class ClaudeBot(discord.Client):
 
             await interaction.response.defer()
 
-            parent_id = _get_forum_parent_id(interaction)
+            parent_id = forum_channel.id if forum_channel else _get_forum_parent_id(interaction)
             sections = []
 
             # Header
@@ -830,18 +838,20 @@ class ClaudeBot(discord.Client):
             title="Short summary of the feedback",
             description="Details (optional)",
             label="Issue label (default: feedback)",
+            forum_channel="Target forum channel (optional if only one project)",
         )
         async def cmd_feedback(
             interaction: discord.Interaction,
             title: str,
             description: str = "",
             label: str = "feedback",
+            forum_channel: discord.ForumChannel | None = None,
         ):
             if not is_allowed(interaction):
                 await interaction.response.send_message("Unauthorized.", ephemeral=True)
                 return
 
-            binding = _get_project_binding(interaction)
+            binding = _get_project_binding(interaction, forum_channel)
             if not binding or not binding.code_repo:
                 await interaction.response.send_message(
                     "No project with a GitHub repo found. Run `/setup` first.",
@@ -941,11 +951,15 @@ class ClaudeBot(discord.Client):
                     await message.reply(
                         "This thread has no active task. Use `/spawn` in the channel to create one."
                     )
-                    return
+                return
 
-            await message.reply(
-                "No active session. Use `/sessions` to pick one, or `/spawn` in a project channel."
-            )
+            # In a regular text channel with no session — ignore silently so
+            # people can chat without the bot replying to every message.
+            # Only respond if the bot is explicitly mentioned.
+            if self.user and self.user.mentioned_in(message):
+                await message.reply(
+                    "No active session here. Use `/sessions` to pick one, or `/spawn` in a project channel."
+                )
             return
 
         content = message.content
@@ -1264,7 +1278,9 @@ def _get_forum_parent_id(interaction: discord.Interaction) -> int | None:
     return None
 
 
-def _get_project_binding(interaction: discord.Interaction):
+def _get_project_binding(interaction: discord.Interaction, forum_channel: discord.ForumChannel | None = None):
+    if forum_channel:
+        return config_store.get_binding(forum_channel.id)
     parent_id = _get_forum_parent_id(interaction)
     if parent_id:
         return config_store.get_binding(parent_id)
