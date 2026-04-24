@@ -99,6 +99,51 @@ class ClaudeBot(discord.Client):
 
     def _register_legacy_commands(self):
 
+        @self.tree.command(name="help", description="Show available commands")
+        async def cmd_help(interaction: discord.Interaction):
+            embed = discord.Embed(
+                title="Claude Code Bridge — Commands",
+                color=discord.Color.blurple(),
+            )
+            embed.add_field(
+                name="Team Collaboration (Forum Channels)",
+                value=(
+                    "`/setup` — Bind this forum channel to a project\n"
+                    "`/spawn <task>` — Create a new agent task (own branch + thread)\n"
+                    "`/status` — List all active agent tasks\n"
+                    "`/board` — Full dashboard: status, tasks, PRs, notes\n"
+                    "`/note <text>` — Add a note to NOTES.md and push\n"
+                    "`/notes` — Display project NOTES.md"
+                ),
+                inline=False,
+            )
+            embed.add_field(
+                name="Session Management",
+                value=(
+                    "`/sessions` — List and pick a live Claude Code session\n"
+                    "`/current` — Show current session or task info\n"
+                    "`/new <dir>` — Start a new session in a directory\n"
+                    "`/detach` — Disconnect from current session"
+                ),
+                inline=False,
+            )
+            embed.add_field(
+                name="During a Session",
+                value=(
+                    "*(any message)* — Send to the active session\n"
+                    "`/cancel` — Cancel the running operation\n"
+                    "`/cost` — Show session cost so far"
+                ),
+                inline=False,
+            )
+            embed.add_field(
+                name="Status Reactions",
+                value="⏳ thinking | \U0001f527 tool | \U0001f510 permission | \U0001f4e6 compact | ✅ done | ❌ error | \U0001f6d1 cancelled",
+                inline=False,
+            )
+            embed.set_footer(text="Docs: github.com/yooli23/claude-code-bridge")
+            await interaction.response.send_message(embed=embed, ephemeral=True)
+
         @self.tree.command(name="sessions", description="List available Claude Code sessions")
         async def cmd_sessions(interaction: discord.Interaction):
             if not is_allowed(interaction):
