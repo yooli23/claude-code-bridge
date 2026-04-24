@@ -1,6 +1,12 @@
-"""Discord bot that bridges to Claude Code sessions."""
+"""Discord bot that bridges to Claude Code sessions.
+
+Supports two modes:
+- Single-user: regular channel, /sessions to attach existing sessions
+- Multi-user: forum channel bound to a project via /setup, /spawn creates tasks
+"""
 
 import asyncio
+import json
 import logging
 import os
 import tempfile
@@ -14,6 +20,8 @@ from bridge import ClaudeBridge, PermissionRequest, wrap_channel_message
 from sessions import list_sessions, get_session_by_id, get_last_assistant_message
 from formatter import format_discord, split_message, DISCORD_MAX_LEN
 from message_queue import ChatQueue
+from project_config import ProjectConfigStore, TaskInfo
+from worktree import create_worktree, remove_worktree
 
 load_dotenv()
 
@@ -24,7 +32,8 @@ ALLOWED_USER_ID = int(os.environ.get("DISCORD_ALLOWED_USER_ID", "0"))
 CLAUDE_BIN = os.environ.get("CLAUDE_BIN", "claude")
 CLAUDE_PERMISSION_MODE = os.environ.get("CLAUDE_PERMISSION_MODE", "bypassPermissions")
 
-active_sessions: dict[int, str] = {}  # channel_id -> session_id
+# Single-user mode: channel_id -> session_id (legacy flow)
+active_sessions: dict[int, str] = {}
 
 bridge = ClaudeBridge(
     claude_bin=CLAUDE_BIN,
@@ -32,19 +41,38 @@ bridge = ClaudeBridge(
 )
 
 chat_queue = ChatQueue()
+config_store = ProjectConfigStore()
 
 EDIT_INTERVAL_INITIAL = 0.8
 EDIT_INTERVAL_STEADY = 2.0
 EDIT_INTERVAL_RAMPUP_CHARS = 500
 
+STATUS_TAGS = {
+    "active": "\U0001f527 Active",
+    "done": "✅ Done",
+    "review": "\U0001f4cb Review",
+    "error": "❌ Error",
+}
+
 
 def is_allowed(interaction: discord.Interaction) -> bool:
+    """Check if user is allowed. In forum channels with project bindings, all members are allowed."""
+    channel = interaction.channel
+    parent_id = getattr(channel, "parent_id", None) or interaction.channel_id
+    if config_store.get_binding(parent_id):
+        return True
     if not ALLOWED_USER_ID:
         return True
     return interaction.user.id == ALLOWED_USER_ID
 
 
 def is_allowed_message(message: discord.Message) -> bool:
+    """Check if message author is allowed. Forum thread members are always allowed."""
+    channel = message.channel
+    if isinstance(channel, discord.Thread) and channel.parent:
+        parent_id = channel.parent_id
+        if config_store.get_binding(parent_id):
+            return True
     if not ALLOWED_USER_ID:
         return True
     return message.author.id == ALLOWED_USER_ID
@@ -63,6 +91,12 @@ class ClaudeBot(discord.Client):
         logger.info("Slash commands synced")
 
     def _register_commands(self):
+        self._register_legacy_commands()
+        self._register_project_commands()
+
+    # ── Legacy single-user commands ──────────────────────────
+
+    def _register_legacy_commands(self):
 
         @self.tree.command(name="sessions", description="List available Claude Code sessions")
         async def cmd_sessions(interaction: discord.Interaction):
@@ -96,10 +130,28 @@ class ClaudeBot(discord.Client):
                 return
 
             channel_id = interaction.channel_id
+
+            # Check if this is a forum thread with a task
+            task = config_store.get_task(channel_id)
+            if task:
+                embed = discord.Embed(
+                    title=f"Task: {task.description}",
+                    color=discord.Color.blue(),
+                )
+                embed.add_field(name="Session", value=f"`{task.session_id[:8]}`", inline=True)
+                embed.add_field(name="Branch", value=f"`{task.branch_name}`", inline=True)
+                embed.add_field(name="Status", value=task.status, inline=True)
+                embed.add_field(name="Spawned by", value=task.user_name, inline=True)
+                embed.add_field(name="Worktree", value=f"`{task.worktree_path}`", inline=False)
+                cost = bridge.cost_tracker.get(task.session_id)
+                embed.add_field(name="Cost", value=f"${cost:.4f}", inline=True)
+                await interaction.response.send_message(embed=embed)
+                return
+
             sid = active_sessions.get(channel_id)
             if not sid:
                 await interaction.response.send_message(
-                    "No active session. Use `/sessions` to pick one."
+                    "No active session. Use `/sessions` to pick one or `/spawn` to create a task."
                 )
                 return
 
@@ -153,6 +205,13 @@ class ClaudeBot(discord.Client):
                 return
 
             channel_id = interaction.channel_id
+
+            task = config_store.get_task(channel_id)
+            if task:
+                cost = bridge.cost_tracker.get(task.session_id)
+                await interaction.response.send_message(f"Task cost so far: **${cost:.4f}**")
+                return
+
             sid = active_sessions.get(channel_id)
             if not sid:
                 await interaction.response.send_message("No active session.")
@@ -167,8 +226,6 @@ class ClaudeBot(discord.Client):
             if not is_allowed(interaction):
                 await interaction.response.send_message("Unauthorized.", ephemeral=True)
                 return
-
-            import json
 
             cwd = os.path.expanduser(directory)
             if not os.path.isdir(cwd):
@@ -214,6 +271,261 @@ class ClaudeBot(discord.Client):
                 "Use `/sessions` to find and select it."
             )
 
+    # ── Multi-user project commands ──────────────────────────
+
+    def _register_project_commands(self):
+
+        @self.tree.command(name="setup", description="Bind this forum channel to a project")
+        @app_commands.describe(
+            project_dir="Local project directory path",
+            code_repo="GitHub code repo (org/repo)",
+            paper_repo="GitHub paper repo (org/repo, optional)",
+        )
+        async def cmd_setup(
+            interaction: discord.Interaction,
+            project_dir: str,
+            code_repo: str = "",
+            paper_repo: str = "",
+        ):
+            if not is_allowed(interaction):
+                await interaction.response.send_message("Unauthorized.", ephemeral=True)
+                return
+
+            channel = interaction.channel
+            if not isinstance(channel, discord.ForumChannel):
+                await interaction.response.send_message(
+                    "This command only works in **Forum channels**. "
+                    "Create a Forum channel for your project first.",
+                    ephemeral=True,
+                )
+                return
+
+            expanded = os.path.expanduser(project_dir)
+            if not os.path.isdir(expanded):
+                await interaction.response.send_message(
+                    f"Directory not found: `{expanded}`", ephemeral=True
+                )
+                return
+
+            binding = config_store.bind(
+                channel_id=channel.id,
+                project_dir=expanded,
+                code_repo=code_repo,
+                paper_repo=paper_repo,
+            )
+
+            embed = discord.Embed(
+                title="Project bound to this channel",
+                color=discord.Color.green(),
+            )
+            embed.add_field(name="Directory", value=f"`{expanded}`", inline=False)
+            if code_repo:
+                embed.add_field(name="Code repo", value=f"`{code_repo}`", inline=True)
+            if paper_repo:
+                embed.add_field(name="Paper repo", value=f"`{paper_repo}`", inline=True)
+            embed.set_footer(text="Use /spawn <task> to create tasks in this channel.")
+            await interaction.response.send_message(embed=embed)
+
+        @self.tree.command(name="spawn", description="Spawn a new agent task (creates a forum post)")
+        @app_commands.describe(task="Description of the task for the agent")
+        async def cmd_spawn(interaction: discord.Interaction, task: str):
+            if not is_allowed(interaction):
+                await interaction.response.send_message("Unauthorized.", ephemeral=True)
+                return
+
+            channel = interaction.channel
+            forum_channel = None
+
+            # If used in a forum channel directly
+            if isinstance(channel, discord.ForumChannel):
+                forum_channel = channel
+            # If used inside a forum thread, get the parent
+            elif isinstance(channel, discord.Thread) and isinstance(channel.parent, discord.ForumChannel):
+                forum_channel = channel.parent
+
+            if not forum_channel:
+                await interaction.response.send_message(
+                    "Use `/spawn` in a Forum channel that has been set up with `/setup`.",
+                    ephemeral=True,
+                )
+                return
+
+            binding = config_store.get_binding(forum_channel.id)
+            if not binding:
+                await interaction.response.send_message(
+                    "This channel has no project binding. Use `/setup` first.",
+                    ephemeral=True,
+                )
+                return
+
+            await interaction.response.defer()
+
+            # Create git worktree
+            try:
+                worktree_path, branch_name = await create_worktree(
+                    binding.project_dir, task, interaction.user.display_name
+                )
+            except RuntimeError as e:
+                await interaction.followup.send(f"Failed to create worktree: {e}")
+                return
+
+            # Start a new Claude Code session in the worktree
+            cmd = [
+                CLAUDE_BIN,
+                "--print",
+                "--permission-mode", CLAUDE_PERMISSION_MODE,
+                "--output-format", "json",
+                "-p", "Say 'Session started. Ready for instructions.' and nothing else.",
+            ]
+            if CLAUDE_PERMISSION_MODE == "bypassPermissions":
+                cmd.insert(1, "--allow-dangerously-skip-permissions")
+
+            process = await asyncio.create_subprocess_exec(
+                *cmd,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+                cwd=worktree_path,
+            )
+            stdout, stderr = await process.communicate()
+
+            session_id = ""
+            try:
+                result = json.loads(stdout.decode())
+                session_id = result.get("session_id", "")
+            except (json.JSONDecodeError, KeyError):
+                pass
+
+            if not session_id:
+                await remove_worktree(binding.project_dir, worktree_path)
+                await interaction.followup.send("Failed to create Claude session.")
+                return
+
+            # Create the forum post (thread)
+            user_name = interaction.user.display_name
+            thread_content = (
+                f"**Task:** {task}\n"
+                f"**Spawned by:** {user_name}\n"
+                f"**Branch:** `{branch_name}`\n"
+                f"**Session:** `{session_id[:8]}`"
+            )
+
+            # Find or create status tags
+            available_tags = {t.name: t for t in forum_channel.available_tags}
+            active_tag = available_tags.get(STATUS_TAGS["active"])
+            tags_to_apply = [active_tag] if active_tag else []
+
+            thread_with_message = await forum_channel.create_thread(
+                name=f"{task[:90]}",
+                content=thread_content,
+                applied_tags=tags_to_apply,
+            )
+            thread = thread_with_message.thread
+
+            # Register the task
+            task_info = TaskInfo(
+                thread_id=thread.id,
+                session_id=session_id,
+                worktree_path=worktree_path,
+                branch_name=branch_name,
+                user_id=interaction.user.id,
+                user_name=user_name,
+                description=task,
+                status="active",
+                project_dir=binding.project_dir,
+            )
+            config_store.add_task(task_info)
+
+            # Also register in active_sessions so message handling works
+            active_sessions[thread.id] = session_id
+
+            embed = discord.Embed(
+                title="Task spawned",
+                color=discord.Color.green(),
+            )
+            embed.add_field(name="Thread", value=thread.mention, inline=True)
+            embed.add_field(name="Branch", value=f"`{branch_name}`", inline=True)
+            embed.set_footer(text="Send messages in the thread to work with the agent.")
+            await interaction.followup.send(embed=embed)
+
+            # Send the initial task to Claude in the thread
+            wrapped = wrap_channel_message(
+                content=f"Your task: {task}\n\nRead STATUS.md if it exists for project context. Read CLAUDE.md for project conventions. Then start working on the task.",
+                source="discord",
+                user=user_name,
+                chat_id=str(thread.id),
+            )
+
+            bot_ref = self
+
+            # Create a synthetic message-like context for the thread
+            initial_msg = await thread.send("Starting work on this task...")
+            await initial_msg.add_reaction("⏳")
+
+            async def process_initial(msg_text: str):
+                await _process_thread_message(bot_ref, thread, initial_msg, session_id, worktree_path, msg_text)
+
+            await chat_queue.enqueue(thread.id, wrapped, process_initial)
+
+        @self.tree.command(name="status", description="Show all active tasks in this project")
+        async def cmd_status(interaction: discord.Interaction):
+            if not is_allowed(interaction):
+                await interaction.response.send_message("Unauthorized.", ephemeral=True)
+                return
+
+            channel = interaction.channel
+            parent_id = None
+
+            if isinstance(channel, discord.ForumChannel):
+                parent_id = channel.id
+            elif isinstance(channel, discord.Thread) and isinstance(channel.parent, discord.ForumChannel):
+                parent_id = channel.parent_id
+
+            if not parent_id:
+                await interaction.response.send_message(
+                    "Use `/status` in a project forum channel.", ephemeral=True
+                )
+                return
+
+            binding = config_store.get_binding(parent_id)
+            if not binding:
+                await interaction.response.send_message("No project binding found.", ephemeral=True)
+                return
+
+            tasks = config_store.get_tasks_for_channel(parent_id)
+
+            if not tasks:
+                await interaction.response.send_message("No active tasks.")
+                return
+
+            embed = discord.Embed(
+                title="Project Tasks",
+                description=f"`{binding.project_dir}`",
+                color=discord.Color.blue(),
+            )
+
+            for t in tasks:
+                status_icon = {
+                    "active": "\U0001f527",
+                    "done": "✅",
+                    "review": "\U0001f4cb",
+                    "error": "❌",
+                }.get(t.status, "❓")
+
+                cost = bridge.cost_tracker.get(t.session_id)
+                value = (
+                    f"By: {t.user_name} | Branch: `{t.branch_name}`\n"
+                    f"Cost: ${cost:.4f} | <#{t.thread_id}>"
+                )
+                embed.add_field(
+                    name=f"{status_icon} {t.description[:50]}",
+                    value=value,
+                    inline=False,
+                )
+
+            await interaction.response.send_message(embed=embed)
+
+    # ── Message handling ─────────────────────────────────────
+
     async def on_ready(self):
         logger.info(f"Discord bot logged in as {self.user}")
 
@@ -222,20 +534,40 @@ class ClaudeBot(discord.Client):
             return
         logger.info(f"Message from {message.author} (id={message.author.id}): {message.content[:50]}")
         if not is_allowed_message(message):
-            logger.warning(f"Rejected: user {message.author.id} not in allowed list (expected {ALLOWED_USER_ID})")
+            logger.warning(f"Rejected: user {message.author.id} not in allowed list")
             return
 
-        channel_id = message.channel.id
-        session_id = active_sessions.get(channel_id)
+        channel = message.channel
+        channel_id = channel.id
+
+        # Determine session: check forum task first, then legacy active_sessions
+        session_id = None
+        session_cwd = None
+
+        task = config_store.get_task(channel_id)
+        if task:
+            session_id = task.session_id
+            session_cwd = task.worktree_path
+        else:
+            session_id = active_sessions.get(channel_id)
+            if session_id:
+                session = get_session_by_id(session_id)
+                session_cwd = session.cwd if session else None
 
         if not session_id:
+            # In a forum thread without a task? Guide them
+            if isinstance(channel, discord.Thread) and isinstance(channel.parent, discord.ForumChannel):
+                binding = config_store.get_binding(channel.parent_id)
+                if binding:
+                    await message.reply(
+                        "This thread has no active task. Use `/spawn` in the channel to create one."
+                    )
+                    return
+
             await message.reply(
-                "No active session in this channel. Use `/sessions` to pick one."
+                "No active session. Use `/sessions` to pick one, or `/spawn` in a project channel."
             )
             return
-
-        session = get_session_by_id(session_id)
-        session_cwd = session.cwd if session else None
 
         content = message.content
         if self.user:
@@ -258,12 +590,149 @@ class ClaudeBot(discord.Client):
 
         bot_ref = self
 
-        async def process_message(msg_text: str):
-            await _process_single_message(bot_ref, message, session_id, session_cwd, msg_text)
+        if task:
+            async def process_message(msg_text: str):
+                await _process_thread_message(bot_ref, channel, message, task.session_id, task.worktree_path, msg_text)
+        else:
+            async def process_message(msg_text: str):
+                await _process_single_message(bot_ref, message, session_id, session_cwd, msg_text)
 
         depth = await chat_queue.enqueue(channel_id, wrapped, process_message)
         if depth > 0:
             await message.reply(f"Queued (position {depth}). Claude is still working...")
+
+
+# ── Message processing ───────────────────────────────────
+
+
+async def _process_thread_message(
+    bot: ClaudeBot,
+    thread: discord.Thread | discord.abc.Messageable,
+    message: discord.Message,
+    session_id: str,
+    worktree_path: str,
+    message_text: str,
+):
+    """Process a message in a forum thread task."""
+    channel_id = message.channel.id
+
+    await message.add_reaction("⏳")
+    reply = await message.reply("...")
+
+    last_edit_time = 0.0
+    last_edit_text = ""
+    tool_active = False
+
+    async def on_delta(text_so_far: str, tool_status: str = ""):
+        nonlocal last_edit_time, last_edit_text, tool_active
+        now = time.time()
+
+        interval = (
+            EDIT_INTERVAL_INITIAL
+            if len(text_so_far) < EDIT_INTERVAL_RAMPUP_CHARS
+            else EDIT_INTERVAL_STEADY
+        )
+        if now - last_edit_time < interval:
+            return
+
+        display = text_so_far
+        if tool_status:
+            display = f"*{tool_status}*\n\n{display}"
+
+        if len(display) > DISCORD_MAX_LEN:
+            display = display[:DISCORD_MAX_LEN - 30] + "\n\n...(streaming)"
+
+        if display == last_edit_text:
+            return
+
+        try:
+            await reply.edit(content=display)
+            last_edit_time = now
+            last_edit_text = display
+        except Exception:
+            pass
+
+        if tool_status and not tool_active:
+            tool_active = True
+            try:
+                await message.remove_reaction("⏳", bot.user)
+                await message.add_reaction("\U0001f527")
+            except Exception:
+                pass
+        elif not tool_status and tool_active:
+            tool_active = False
+            try:
+                await message.remove_reaction("\U0001f527", bot.user)
+                await message.add_reaction("⏳")
+            except Exception:
+                pass
+
+    async def on_cost_threshold(total: float, threshold: float):
+        await message.channel.send(
+            f"**Cost alert:** task has spent ${total:.2f} (crossed ${threshold:.0f} threshold)"
+        )
+
+    async def on_compaction():
+        try:
+            await message.remove_reaction("⏳", bot.user)
+            await message.remove_reaction("\U0001f527", bot.user)
+        except Exception:
+            pass
+        await message.add_reaction("\U0001f4e6")
+
+    async def on_permission_request(perm: PermissionRequest):
+        view = PermissionView(channel_id, perm.request_id)
+        preview = perm.preview
+        text = f"**Permission needed: {perm.tool_name}**\n```\n{preview}\n```"
+        if len(text) > DISCORD_MAX_LEN:
+            text = text[:DISCORD_MAX_LEN - 10] + "\n```"
+        await message.channel.send(text, view=view)
+        await message.add_reaction("\U0001f510")
+
+    try:
+        async with message.channel.typing():
+            response = await bridge.send_message(
+                session_id=session_id,
+                message=message_text,
+                cwd=worktree_path,
+                chat_id=channel_id,
+                on_delta=on_delta,
+                on_cost_threshold=on_cost_threshold,
+                on_compaction=on_compaction,
+                on_permission_request=on_permission_request,
+            )
+    except Exception as e:
+        logger.error(f"Bridge error: {e}")
+        await reply.edit(content=f"Error: {e}")
+        await _swap_reaction(message, bot.user, "❌")
+        task = config_store.get_task(channel_id)
+        if task:
+            config_store.update_task_status(channel_id, "error")
+        return
+
+    if response == "(cancelled)":
+        try:
+            await reply.edit(content="(cancelled)")
+        except Exception:
+            pass
+        await _swap_reaction(message, bot.user, "\U0001f6d1")
+        return
+
+    chunks = format_discord(response)
+
+    if not chunks:
+        await _swap_reaction(message, bot.user, "❌")
+        return
+
+    try:
+        await reply.edit(content=chunks[0].text)
+    except Exception:
+        await message.reply(chunks[0].text)
+
+    for chunk in chunks[1:]:
+        await message.reply(chunk.text)
+
+    await _swap_reaction(message, bot.user, "✅")
 
 
 async def _process_single_message(
@@ -273,7 +742,7 @@ async def _process_single_message(
     session_cwd: str | None,
     message_text: str,
 ):
-    """Process a single message through Claude with full streaming UX."""
+    """Process a single message through Claude with full streaming UX (legacy single-user)."""
     channel_id = message.channel.id
 
     await message.add_reaction("⏳")
@@ -316,13 +785,13 @@ async def _process_single_message(
             tool_active = True
             try:
                 await message.remove_reaction("⏳", bot.user)
-                await message.add_reaction("🔧")
+                await message.add_reaction("\U0001f527")
             except Exception:
                 pass
         elif not tool_status and tool_active:
             tool_active = False
             try:
-                await message.remove_reaction("🔧", bot.user)
+                await message.remove_reaction("\U0001f527", bot.user)
                 await message.add_reaction("⏳")
             except Exception:
                 pass
@@ -335,10 +804,10 @@ async def _process_single_message(
     async def on_compaction():
         try:
             await message.remove_reaction("⏳", bot.user)
-            await message.remove_reaction("🔧", bot.user)
+            await message.remove_reaction("\U0001f527", bot.user)
         except Exception:
             pass
-        await message.add_reaction("📦")
+        await message.add_reaction("\U0001f4e6")
 
     async def on_permission_request(perm: PermissionRequest):
         view = PermissionView(channel_id, perm.request_id)
@@ -347,7 +816,7 @@ async def _process_single_message(
         if len(text) > DISCORD_MAX_LEN:
             text = text[:DISCORD_MAX_LEN - 10] + "\n```"
         await message.channel.send(text, view=view)
-        await message.add_reaction("🔐")
+        await message.add_reaction("\U0001f510")
 
     try:
         async with message.channel.typing():
@@ -372,7 +841,7 @@ async def _process_single_message(
             await reply.edit(content="(cancelled)")
         except Exception:
             pass
-        await _swap_reaction(message, bot.user, "🛑")
+        await _swap_reaction(message, bot.user, "\U0001f6d1")
         return
 
     chunks = format_discord(response)
