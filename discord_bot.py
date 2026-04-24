@@ -551,7 +551,7 @@ class ClaudeBot(discord.Client):
             tags_to_apply = [active_tag] if active_tag else []
 
             thread_with_message = await forum_channel.create_thread(
-                name=f"{task[:90]}",
+                name=f"[{user_name}] {task[:80]}",
                 content=thread_content,
                 applied_tags=tags_to_apply,
             )
