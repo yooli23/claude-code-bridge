@@ -39,6 +39,13 @@ class TaskInfo:
     status: str = "active"
     project_dir: str = ""
 
+    def to_dict(self) -> dict:
+        return asdict(self)
+
+    @classmethod
+    def from_dict(cls, data: dict) -> "TaskInfo":
+        return cls(**{k: v for k, v in data.items() if k in cls.__dataclass_fields__})
+
 
 class ProjectConfigStore:
     def __init__(self):
@@ -55,12 +62,18 @@ class ProjectConfigStore:
             for item in data.get("projects", []):
                 binding = ProjectBinding.from_dict(item)
                 self._bindings[binding.channel_id] = binding
+            for item in data.get("tasks", []):
+                task = TaskInfo.from_dict(item)
+                self._tasks[task.thread_id] = task
         except (json.JSONDecodeError, OSError) as e:
             logger.error(f"Failed to load project config: {e}")
 
     def _save(self):
         CONFIG_DIR.mkdir(parents=True, exist_ok=True)
-        data = {"projects": [b.to_dict() for b in self._bindings.values()]}
+        data = {
+            "projects": [b.to_dict() for b in self._bindings.values()],
+            "tasks": [t.to_dict() for t in self._tasks.values()],
+        }
         with open(CONFIG_FILE, "w") as f:
             json.dump(data, f, indent=2)
 
@@ -90,6 +103,7 @@ class ProjectConfigStore:
 
     def add_task(self, task: TaskInfo):
         self._tasks[task.thread_id] = task
+        self._save()
 
     def get_task(self, thread_id: int) -> TaskInfo | None:
         return self._tasks.get(thread_id)
@@ -107,6 +121,8 @@ class ProjectConfigStore:
         task = self._tasks.get(thread_id)
         if task:
             task.status = status
+            self._save()
 
     def remove_task(self, thread_id: int):
         self._tasks.pop(thread_id, None)
+        self._save()

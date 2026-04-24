@@ -775,6 +775,17 @@ class ClaudeBot(discord.Client):
     async def on_ready(self):
         logger.info(f"Discord bot logged in as {self.user}")
 
+        # Restore active sessions from persisted tasks
+        restored = 0
+        for task in list(config_store._tasks.values()):
+            if task.status == "active" and os.path.isdir(task.worktree_path):
+                active_sessions[task.thread_id] = task.session_id
+                restored += 1
+            elif not os.path.isdir(task.worktree_path):
+                config_store.update_task_status(task.thread_id, "done")
+        if restored:
+            logger.info(f"Restored {restored} active task(s) from previous session")
+
     async def on_message(self, message: discord.Message):
         if message.author.bot:
             return
