@@ -21,6 +21,7 @@ from sessions import list_sessions, get_session_by_id, get_last_assistant_messag
 from formatter import format_discord, split_message, DISCORD_MAX_LEN
 from message_queue import ChatQueue
 from project_config import ProjectConfigStore, TaskInfo
+from project_scaffold import scaffold_project
 from worktree import create_worktree, remove_worktree
 
 load_dotenv()
@@ -307,12 +308,39 @@ class ClaudeBot(discord.Client):
                 )
                 return
 
+            await interaction.response.defer()
+
             binding = config_store.bind(
                 channel_id=channel.id,
                 project_dir=expanded,
                 code_repo=code_repo,
                 paper_repo=paper_repo,
             )
+
+            # Scaffold CLAUDE.md, STATUS.md, NOTES.md
+            created = scaffold_project(expanded, code_repo, paper_repo)
+            if created:
+                proc = await asyncio.create_subprocess_exec(
+                    "git", "add", *created,
+                    cwd=expanded,
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE,
+                )
+                await proc.communicate()
+                proc = await asyncio.create_subprocess_exec(
+                    "git", "commit", "-m", f"Add project scaffold: {', '.join(created)}",
+                    cwd=expanded,
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE,
+                )
+                await proc.communicate()
+                proc = await asyncio.create_subprocess_exec(
+                    "git", "push",
+                    cwd=expanded,
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE,
+                )
+                await proc.communicate()
 
             embed = discord.Embed(
                 title="Project bound to this channel",
@@ -323,8 +351,10 @@ class ClaudeBot(discord.Client):
                 embed.add_field(name="Code repo", value=f"`{code_repo}`", inline=True)
             if paper_repo:
                 embed.add_field(name="Paper repo", value=f"`{paper_repo}`", inline=True)
+            if created:
+                embed.add_field(name="Created", value=", ".join(f"`{f}`" for f in created), inline=False)
             embed.set_footer(text="Use /spawn <task> to create tasks in this channel.")
-            await interaction.response.send_message(embed=embed)
+            await interaction.followup.send(embed=embed)
 
         @self.tree.command(name="spawn", description="Spawn a new agent task (creates a forum post)")
         @app_commands.describe(task="Description of the task for the agent")
@@ -448,8 +478,24 @@ class ClaudeBot(discord.Client):
             await interaction.followup.send(embed=embed)
 
             # Send the initial task to Claude in the thread
+            initial_instructions = (
+                f"Your task: {task}\n\n"
+                f"You are working on branch `{branch_name}` in a git worktree.\n\n"
+                "Before you start:\n"
+                "1. Read CLAUDE.md for project workflow rules\n"
+                "2. Read STATUS.md for current project state and active tasks\n"
+                "3. Read NOTES.md for related work and shared context\n\n"
+                "When you finish:\n"
+                "1. Commit your changes\n"
+                f"2. Push: `git push -u origin {branch_name}`\n"
+                f"3. Create a PR: `gh pr create --title '<title>' --body '<description>'`"
+                f"{' --repo ' + binding.code_repo if binding.code_repo else ''}\n"
+                "4. Update STATUS.md with your completed task and PR link\n"
+                "5. Commit and push the STATUS.md update\n\n"
+                "Now start working on the task."
+            )
             wrapped = wrap_channel_message(
-                content=f"Your task: {task}\n\nRead STATUS.md if it exists for project context. Read CLAUDE.md for project conventions. Then start working on the task.",
+                content=initial_instructions,
                 source="discord",
                 user=user_name,
                 chat_id=str(thread.id),
@@ -572,7 +618,15 @@ class ClaudeBot(discord.Client):
             )
             await proc.communicate()
 
-            await interaction.followup.send(f"Added to NOTES.md:\n> {content}")
+            proc = await asyncio.create_subprocess_exec(
+                "git", "push",
+                cwd=binding.project_dir,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            await proc.communicate()
+
+            await interaction.followup.send(f"Added to NOTES.md and pushed:\n> {content}")
 
         @self.tree.command(name="notes", description="Show project NOTES.md")
         async def cmd_notes(interaction: discord.Interaction):
