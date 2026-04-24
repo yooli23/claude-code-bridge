@@ -390,9 +390,10 @@ class ClaudeBot(discord.Client):
                 await proc.communicate()
 
             embed = discord.Embed(
-                title="Project bound to this channel",
+                title=f"Project bound to #{forum_channel.name}",
                 color=discord.Color.green(),
             )
+            embed.add_field(name="Forum channel", value=forum_channel.mention, inline=False)
             embed.add_field(name="Directory", value=f"`{expanded}`", inline=False)
             if code_repo:
                 embed.add_field(name="Code repo", value=f"`{code_repo}`", inline=True)
@@ -400,7 +401,7 @@ class ClaudeBot(discord.Client):
                 embed.add_field(name="Paper repo", value=f"`{paper_repo}`", inline=True)
             if created:
                 embed.add_field(name="Created", value=", ".join(f"`{f}`" for f in created), inline=False)
-            embed.set_footer(text="Use /spawn <task> to create tasks in this channel.")
+            embed.set_footer(text="Use /spawn <task> to create tasks.")
             await interaction.followup.send(embed=embed)
 
         @self.tree.command(name="spawn", description="Spawn a new agent task (creates a forum post)")
