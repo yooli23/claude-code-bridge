@@ -56,15 +56,31 @@ STATUS_TAGS = {
 }
 
 
+def is_admin(interaction: discord.Interaction) -> bool:
+    """Check if user is an admin (server owner, has Administrator perm, or is ALLOWED_USER_ID)."""
+    if ALLOWED_USER_ID and interaction.user.id == ALLOWED_USER_ID:
+        return True
+    if interaction.guild and interaction.guild.owner_id == interaction.user.id:
+        return True
+    if isinstance(interaction.user, discord.Member) and interaction.user.guild_permissions.administrator:
+        return True
+    return False
+
+
 def is_allowed(interaction: discord.Interaction) -> bool:
-    """Check if user is allowed. In forum channels with project bindings, all members are allowed."""
+    """Check if user is allowed. Admins always pass. Members pass in project channels."""
+    if is_admin(interaction):
+        return True
     channel = interaction.channel
     parent_id = getattr(channel, "parent_id", None) or interaction.channel_id
     if config_store.get_binding(parent_id):
         return True
-    if not ALLOWED_USER_ID:
-        return True
-    return interaction.user.id == ALLOWED_USER_ID
+    # Check if there's a project in this server (for commands run from text channels)
+    if interaction.guild:
+        for cid in config_store._bindings:
+            if interaction.guild.get_channel(cid) is not None:
+                return True
+    return False
 
 
 def is_allowed_message(message: discord.Message) -> bool:
@@ -106,33 +122,26 @@ class ClaudeBot(discord.Client):
                 color=discord.Color.blurple(),
             )
             embed.add_field(
-                name="Team Collaboration (Forum Channels)",
+                name="Project Commands",
                 value=(
-                    "`/setup` — Bind this forum channel to a project\n"
                     "`/spawn <task>` — Create a new agent task (own branch + thread)\n"
                     "`/status` — List all active agent tasks\n"
                     "`/board` — Full dashboard: status, tasks, PRs, notes\n"
                     "`/note <text>` — Add a note to NOTES.md and push\n"
-                    "`/notes` — Display project NOTES.md"
+                    "`/notes` — Display project NOTES.md\n"
+                    "`/current` — Show current task info\n"
+                    "`/cost` — Show session cost"
                 ),
                 inline=False,
             )
             embed.add_field(
-                name="Session Management",
+                name="Admin Commands",
                 value=(
-                    "`/sessions` — List and pick a live Claude Code session\n"
-                    "`/current` — Show current session or task info\n"
-                    "`/new <dir>` — Start a new session in a directory\n"
-                    "`/detach` — Disconnect from current session"
-                ),
-                inline=False,
-            )
-            embed.add_field(
-                name="During a Session",
-                value=(
-                    "*(any message)* — Send to the active session\n"
-                    "`/cancel` — Cancel the running operation\n"
-                    "`/cost` — Show session cost so far"
+                    "`/setup` — Bind a forum channel to a project\n"
+                    "`/sessions` — List and pick a live session\n"
+                    "`/new <dir>` — Start a new raw session\n"
+                    "`/cancel` — Cancel a running operation\n"
+                    "`/detach` — Disconnect from session"
                 ),
                 inline=False,
             )
@@ -144,10 +153,10 @@ class ClaudeBot(discord.Client):
             embed.set_footer(text="Docs: github.com/yooli23/claude-code-bridge")
             await interaction.response.send_message(embed=embed, ephemeral=True)
 
-        @self.tree.command(name="sessions", description="List available Claude Code sessions")
+        @self.tree.command(name="sessions", description="List available Claude Code sessions (admin)")
         async def cmd_sessions(interaction: discord.Interaction):
-            if not is_allowed(interaction):
-                await interaction.response.send_message("Unauthorized.", ephemeral=True)
+            if not is_admin(interaction):
+                await interaction.response.send_message("Admin only.", ephemeral=True)
                 return
 
             sessions = list_sessions()
@@ -217,10 +226,10 @@ class ClaudeBot(discord.Client):
                     f"Active session: `{sid[:8]}` (details unavailable)\nCost: ${cost:.4f}"
                 )
 
-        @self.tree.command(name="detach", description="Detach from current session")
+        @self.tree.command(name="detach", description="Detach from current session (admin)")
         async def cmd_detach(interaction: discord.Interaction):
-            if not is_allowed(interaction):
-                await interaction.response.send_message("Unauthorized.", ephemeral=True)
+            if not is_admin(interaction):
+                await interaction.response.send_message("Admin only.", ephemeral=True)
                 return
 
             channel_id = interaction.channel_id
@@ -230,10 +239,10 @@ class ClaudeBot(discord.Client):
             else:
                 await interaction.response.send_message("No active session.")
 
-        @self.tree.command(name="cancel", description="Cancel the current operation")
+        @self.tree.command(name="cancel", description="Cancel the current operation (admin)")
         async def cmd_cancel(interaction: discord.Interaction):
-            if not is_allowed(interaction):
-                await interaction.response.send_message("Unauthorized.", ephemeral=True)
+            if not is_admin(interaction):
+                await interaction.response.send_message("Admin only.", ephemeral=True)
                 return
 
             channel_id = interaction.channel_id
@@ -266,11 +275,11 @@ class ClaudeBot(discord.Client):
             cost = bridge.cost_tracker.get(sid)
             await interaction.response.send_message(f"Session cost so far: **${cost:.4f}**")
 
-        @self.tree.command(name="new", description="Start a new Claude Code session")
+        @self.tree.command(name="new", description="Start a new Claude Code session (admin)")
         @app_commands.describe(directory="Working directory for the new session")
         async def cmd_new(interaction: discord.Interaction, directory: str = "~"):
-            if not is_allowed(interaction):
-                await interaction.response.send_message("Unauthorized.", ephemeral=True)
+            if not is_admin(interaction):
+                await interaction.response.send_message("Admin only.", ephemeral=True)
                 return
 
             cwd = os.path.expanduser(directory)
@@ -321,7 +330,7 @@ class ClaudeBot(discord.Client):
 
     def _register_project_commands(self):
 
-        @self.tree.command(name="setup", description="Bind a forum channel to a project")
+        @self.tree.command(name="setup", description="Bind a forum channel to a project (admin)")
         @app_commands.describe(
             forum_channel="The forum channel to bind",
             project_dir="Local project directory path",
@@ -335,8 +344,8 @@ class ClaudeBot(discord.Client):
             code_repo: str = "",
             paper_repo: str = "",
         ):
-            if not is_allowed(interaction):
-                await interaction.response.send_message("Unauthorized.", ephemeral=True)
+            if not is_admin(interaction):
+                await interaction.response.send_message("Admin only.", ephemeral=True)
                 return
 
             expanded = os.path.expanduser(project_dir)
