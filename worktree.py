@@ -34,6 +34,22 @@ async def create_worktree(project_dir: str, task_description: str, user_name: st
         worktree_path = f"{worktree_path}-{counter}"
         branch_name = f"{branch_name}-{counter}"
 
+    # Clean up stale branch if it exists (from a previous failed attempt)
+    proc = await asyncio.create_subprocess_exec(
+        "git", "branch", "-D", branch_name,
+        cwd=project_dir,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+    )
+    await proc.communicate()
+
+    await asyncio.create_subprocess_exec(
+        "git", "worktree", "prune",
+        cwd=project_dir,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+    )
+
     proc = await asyncio.create_subprocess_exec(
         "git", "worktree", "add", "-b", branch_name, worktree_path,
         cwd=project_dir,
