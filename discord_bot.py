@@ -143,7 +143,8 @@ class ClaudeBot(discord.Client):
                     "`/note <text>` — Add a note to NOTES.md and push\n"
                     "`/notes` — Display project NOTES.md\n"
                     "`/current` — Show current task info\n"
-                    "`/cost` — Show session cost"
+                    "`/cost` — Show session cost\n"
+                    "`/feedback <title>` — Report a bug or suggestion as a GitHub Issue"
                 ),
                 inline=False,
             )
@@ -823,6 +824,73 @@ class ClaudeBot(discord.Client):
             await interaction.followup.send(chunks[0])
             for chunk in chunks[1:]:
                 await interaction.followup.send(chunk)
+
+        @self.tree.command(name="feedback", description="Report a bug or suggestion as a GitHub Issue")
+        @app_commands.describe(
+            title="Short summary of the feedback",
+            description="Details (optional)",
+            label="Issue label (default: feedback)",
+        )
+        async def cmd_feedback(
+            interaction: discord.Interaction,
+            title: str,
+            description: str = "",
+            label: str = "feedback",
+        ):
+            if not is_allowed(interaction):
+                await interaction.response.send_message("Unauthorized.", ephemeral=True)
+                return
+
+            binding = _get_project_binding(interaction)
+            if not binding or not binding.code_repo:
+                await interaction.response.send_message(
+                    "No project with a GitHub repo found. Run `/setup` first.",
+                    ephemeral=True,
+                )
+                return
+
+            await interaction.response.defer()
+
+            user_name = interaction.user.display_name
+            body = f"**Reported by:** {user_name} (via Discord)\n\n"
+            if description:
+                body += description
+            else:
+                body += title
+
+            proc = await asyncio.create_subprocess_exec(
+                "gh", "issue", "create",
+                "--repo", binding.code_repo,
+                "--title", title,
+                "--body", body,
+                "--label", label,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            stdout, stderr = await proc.communicate()
+
+            if proc.returncode != 0:
+                err = stderr.decode().strip()
+                if "label" in err.lower():
+                    proc = await asyncio.create_subprocess_exec(
+                        "gh", "issue", "create",
+                        "--repo", binding.code_repo,
+                        "--title", title,
+                        "--body", body,
+                        stdout=asyncio.subprocess.PIPE,
+                        stderr=asyncio.subprocess.PIPE,
+                    )
+                    stdout, stderr = await proc.communicate()
+
+                if proc.returncode != 0:
+                    err = stderr.decode().strip()
+                    await interaction.followup.send(f"Failed to create issue.\n```\n{err[:500]}\n```")
+                    return
+
+            issue_url = stdout.decode().strip()
+            await interaction.followup.send(
+                f"Issue created: {issue_url}"
+            )
 
     # ── Message handling ─────────────────────────────────────
 
