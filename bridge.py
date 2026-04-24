@@ -171,6 +171,7 @@ class ClaudeBridge:
         on_cost_threshold: callable = None,
         on_compaction: callable = None,
         on_permission_request: callable = None,
+        git_env: dict[str, str] | None = None,
     ) -> str:
         """Send a message to a Claude Code session and return the full response.
 
@@ -211,6 +212,8 @@ class ClaudeBridge:
 
         env = os.environ.copy()
         env["IS_SANDBOX"] = "1"
+        if git_env:
+            env.update(git_env)
 
         process = await asyncio.create_subprocess_exec(
             *cmd,

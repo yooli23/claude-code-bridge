@@ -20,7 +20,7 @@ from bridge import ClaudeBridge, PermissionRequest, wrap_channel_message
 from sessions import list_sessions, get_session_by_id, get_last_assistant_message
 from formatter import format_discord, split_message, DISCORD_MAX_LEN
 from message_queue import ChatQueue
-from project_config import ProjectConfigStore, TaskInfo
+from project_config import ProjectConfigStore, TaskInfo, UserRegistration
 from project_scaffold import scaffold_project
 from worktree import create_worktree, remove_worktree
 
@@ -95,6 +95,18 @@ def is_allowed_message(message: discord.Message) -> bool:
     return message.author.id == ALLOWED_USER_ID
 
 
+def _git_env_for_user(user_id: int) -> dict[str, str] | None:
+    reg = config_store.get_user(user_id)
+    if not reg:
+        return None
+    return {
+        "GIT_AUTHOR_NAME": reg.git_name,
+        "GIT_AUTHOR_EMAIL": reg.git_email,
+        "GIT_COMMITTER_NAME": reg.git_name,
+        "GIT_COMMITTER_EMAIL": reg.git_email,
+    }
+
+
 class ClaudeBot(discord.Client):
     def __init__(self):
         intents = discord.Intents.default()
@@ -124,6 +136,7 @@ class ClaudeBot(discord.Client):
             embed.add_field(
                 name="Project Commands",
                 value=(
+                    "`/register <name> <email>` — Set your git identity for commits\n"
                     "`/spawn <task>` — Create a new agent task (own branch + thread)\n"
                     "`/status` — List all active agent tasks\n"
                     "`/board` — Full dashboard: status, tasks, PRs, notes\n"
@@ -404,6 +417,27 @@ class ClaudeBot(discord.Client):
             embed.set_footer(text="Use /spawn <task> to create tasks.")
             await interaction.followup.send(embed=embed)
 
+        @self.tree.command(name="register", description="Register your Git identity for commits")
+        @app_commands.describe(
+            git_name="Your name for git commits (e.g. 'Jane Doe')",
+            git_email="Your email for git commits (e.g. 'jane@example.com')",
+        )
+        async def cmd_register(
+            interaction: discord.Interaction,
+            git_name: str,
+            git_email: str,
+        ):
+            if not is_allowed(interaction):
+                await interaction.response.send_message("Unauthorized.", ephemeral=True)
+                return
+
+            config_store.register_user(interaction.user.id, git_name, git_email)
+            await interaction.response.send_message(
+                f"Registered git identity: **{git_name}** <{git_email}>\n"
+                "Your spawned tasks will commit under this name.",
+                ephemeral=True,
+            )
+
         @self.tree.command(name="spawn", description="Spawn a new agent task (creates a forum post)")
         @app_commands.describe(
             task="Description of the task for the agent",
@@ -452,6 +486,8 @@ class ClaudeBot(discord.Client):
                 return
 
             # Start a new Claude Code session in the worktree
+            git_env = _git_env_for_user(interaction.user.id)
+
             cmd = [
                 CLAUDE_BIN,
                 "--print",
@@ -462,11 +498,16 @@ class ClaudeBot(discord.Client):
             if CLAUDE_PERMISSION_MODE == "bypassPermissions":
                 cmd.insert(1, "--allow-dangerously-skip-permissions")
 
+            spawn_env = os.environ.copy()
+            if git_env:
+                spawn_env.update(git_env)
+
             process = await asyncio.create_subprocess_exec(
                 *cmd,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
                 cwd=worktree_path,
+                env=spawn_env,
             )
             stdout, stderr = await process.communicate()
 
@@ -562,8 +603,10 @@ class ClaudeBot(discord.Client):
             initial_msg = await thread.send("Starting work on this task...")
             await initial_msg.add_reaction("⏳")
 
+            spawn_user_id = interaction.user.id
+
             async def process_initial(msg_text: str):
-                await _process_thread_message(bot_ref, thread, initial_msg, session_id, worktree_path, msg_text)
+                await _process_thread_message(bot_ref, thread, initial_msg, session_id, worktree_path, msg_text, task_user_id=spawn_user_id)
 
             await chat_queue.enqueue(thread.id, wrapped, process_initial)
 
@@ -859,7 +902,7 @@ class ClaudeBot(discord.Client):
 
         if task:
             async def process_message(msg_text: str):
-                await _process_thread_message(bot_ref, channel, message, task.session_id, task.worktree_path, msg_text)
+                await _process_thread_message(bot_ref, channel, message, task.session_id, task.worktree_path, msg_text, task_user_id=task.user_id)
         else:
             async def process_message(msg_text: str):
                 await _process_single_message(bot_ref, message, session_id, session_cwd, msg_text)
@@ -879,6 +922,7 @@ async def _process_thread_message(
     session_id: str,
     worktree_path: str,
     message_text: str,
+    task_user_id: int | None = None,
 ):
     """Process a message in a forum thread task."""
     channel_id = message.channel.id
@@ -956,6 +1000,8 @@ async def _process_thread_message(
         await message.channel.send(text, view=view)
         await message.add_reaction("\U0001f510")
 
+    git_env = _git_env_for_user(task_user_id) if task_user_id else None
+
     try:
         async with message.channel.typing():
             response = await bridge.send_message(
@@ -967,6 +1013,7 @@ async def _process_thread_message(
                 on_cost_threshold=on_cost_threshold,
                 on_compaction=on_compaction,
                 on_permission_request=on_permission_request,
+                git_env=git_env,
             )
     except Exception as e:
         logger.error(f"Bridge error: {e}")

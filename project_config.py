@@ -47,10 +47,25 @@ class TaskInfo:
         return cls(**{k: v for k, v in data.items() if k in cls.__dataclass_fields__})
 
 
+@dataclass
+class UserRegistration:
+    discord_user_id: int
+    git_name: str
+    git_email: str
+
+    def to_dict(self) -> dict:
+        return asdict(self)
+
+    @classmethod
+    def from_dict(cls, data: dict) -> "UserRegistration":
+        return cls(**{k: v for k, v in data.items() if k in cls.__dataclass_fields__})
+
+
 class ProjectConfigStore:
     def __init__(self):
         self._bindings: dict[int, ProjectBinding] = {}
         self._tasks: dict[int, TaskInfo] = {}
+        self._users: dict[int, UserRegistration] = {}
         self._load()
 
     def _load(self):
@@ -65,6 +80,9 @@ class ProjectConfigStore:
             for item in data.get("tasks", []):
                 task = TaskInfo.from_dict(item)
                 self._tasks[task.thread_id] = task
+            for item in data.get("users", []):
+                user = UserRegistration.from_dict(item)
+                self._users[user.discord_user_id] = user
         except (json.JSONDecodeError, OSError) as e:
             logger.error(f"Failed to load project config: {e}")
 
@@ -73,6 +91,7 @@ class ProjectConfigStore:
         data = {
             "projects": [b.to_dict() for b in self._bindings.values()],
             "tasks": [t.to_dict() for t in self._tasks.values()],
+            "users": [u.to_dict() for u in self._users.values()],
         }
         with open(CONFIG_FILE, "w") as f:
             json.dump(data, f, indent=2)
@@ -126,3 +145,14 @@ class ProjectConfigStore:
     def remove_task(self, thread_id: int):
         self._tasks.pop(thread_id, None)
         self._save()
+
+    def register_user(self, discord_user_id: int, git_name: str, git_email: str):
+        self._users[discord_user_id] = UserRegistration(
+            discord_user_id=discord_user_id,
+            git_name=git_name,
+            git_email=git_email,
+        )
+        self._save()
+
+    def get_user(self, discord_user_id: int) -> UserRegistration | None:
+        return self._users.get(discord_user_id)
